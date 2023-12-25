@@ -1,6 +1,6 @@
 from utils import EuroPagesProductsScraper
 
-# test the class
+# Run scraper
 if __name__ == "__main__":
     # Main execution
     EuroPagesProductsScraper().scrape_and_export()

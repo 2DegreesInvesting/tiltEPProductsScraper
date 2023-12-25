@@ -1,8 +1,7 @@
-# the required imports
+# import required libraries
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 import pandas as pd
-import numpy as np
 import requests
 import hashlib
 import string
