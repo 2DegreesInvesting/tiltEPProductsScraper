@@ -1,9 +1,11 @@
 # import required libraries
 import csv
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, as_completed
+from selenium.webdriver.chrome.service import Service as ChromiumService
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait
 from selenium.webdriver.common.by import By
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium import webdriver
 from bs4 import BeautifulSoup
 from bs4 import Comment
@@ -12,7 +14,6 @@ from tqdm import tqdm
 import chromedriver_autoinstaller
 import pandas as pd
 import numpy as np
-import validators
 import unidecode
 import requests
 import hashlib
@@ -61,13 +62,27 @@ class EuroPagesProductsScraper():
         time.sleep(1)
 
     def get_driver(self):
-        options = webdriver.ChromeOptions() 
-        options.add_argument("--headless") # Set the Chrome webdriver to run in headless mode for 
-        options.add_argument('--no-sandbox')
-        options.add_argument("--disable-dev-shm-using")
-        options.add_argument("disable-infobars")
-        options.add_argument('--blink-settings=imagesEnabled=false')
-        driver = webdriver.Chrome(options=options)
+        if 'DATABRICKS_RUNTIME_VERSION' in os.environ:
+            chrome_driver_path="/tmp/chromedriver/chromedriver-linux64/chromedriver"
+            download_path="/tmp/downloads"
+            option_args = ['--no-sandbox', '--headless', '--disable-dev-shm-usage', "disable-infobars", '--blink-settings=imagesEnabled=false', '--start-maximized'
+                            '--ignore-certificate-errors', '--ignore-ssl-errors']
+            options = webdriver.ChromeOptions() 
+            prefs = {'download.default_directory' : download_path, 'profile.default_content_setting_values.automatic_downloads': 1, 
+                     "download.prompt_for_download": False,"download.directory_upgrade": True, "safebrowsing.enabled": True,
+                     "translate_whitelists": {"vi":"en"}, "translate":{"enabled":"true"}}
+            options.add_experimental_option('prefs', prefs)
+            options.add_experimental_option('excludeSwitches', ['enable-logging'])
+            for option in option_args:
+                options.add_argument(option)
+            driver = webdriver.Chrome(service=ChromiumService(chrome_driver_path), options=options)
+        else:
+            options.add_argument("--headless") # Set the Chrome webdriver to run in headless mode for 
+            options.add_argument('--no-sandbox')
+            options.add_argument("--disable-dev-shm-using")
+            options.add_argument("disable-infobars")
+            options.add_argument('--blink-settings=imagesEnabled=false')
+            driver = webdriver.Chrome(options=options)
         return driver
     
     # Function to generate a unique ID for each product name using a hash function
