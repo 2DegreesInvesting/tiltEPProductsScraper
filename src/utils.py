@@ -1,230 +1,190 @@
 # import required libraries
-import csv
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, as_completed
-from selenium.webdriver.chrome.service import Service as ChromiumService
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium import webdriver
+from contextlib import contextmanager
+from pyspark.sql import SparkSession
+from pyspark.dbutils import DBUtils
 from bs4 import BeautifulSoup
-from bs4 import Comment
 from tqdm import tqdm
 
 import chromedriver_autoinstaller
 import pandas as pd
 import numpy as np
 import unidecode
-import requests
 import hashlib
-import random
-import string
-import time
-import glob
+import csv
 import re
 import os
 
-chromedriver_autoinstaller.install() 
+import itertools
+import asyncio
+import aiohttp
+import codecs
+
+if 'DATABRICKS_RUNTIME_VERSION' not in os.environ:
+    spark = SparkSession.builder.getOrCreate()
+    dbutils = DBUtils(spark)
 
 class EuroPagesProductsScraper():
     """
-
-    A class that scrapes all products from the EuroPages website and outputs a CSV file containing all the products and services.
-
-    @methods:
-
-        retrieve_html(url): retrieves the HTML content of a given URL
-        @args:
-            url: the URL to retrieve the HTML content from
-
-        parse_html(html_content): parses the HTML content of a given URL and extracts the products and services
-        @args:
-            html_content: the HTML content to parse
-        
-        generate_product_id(product_name): generates a unique ID for each product name using a hash function
-        @args:
-            product_name: the product name to generate the ID for
-
-        scrape_and_export(): scrapes all products and services from the EuroPages website and exports them to a CSV file
-
 
     """
 
     def __init__(self):
         self.base_url = "https://www.europages.co.uk/{}/{}.html"
-
-    def cookie_handler(self, provided_driver):
-        # accept the cookies and then wait a little bit
-        try:
-            WebDriverWait(provided_driver, 10).until(EC.element_to_be_clickable((By.ID, "cookiescript_accept"))).click()
-        except Exception as e:
-            pass
-        time.sleep(1)
-
-    def get_driver(self):
-        options = webdriver.ChromeOptions() 
-        if 'DATABRICKS_RUNTIME_VERSION' in os.environ:
-            chrome_driver_path="/tmp/chromedriver/chromedriver-linux64/chromedriver"
-            download_path="/tmp/downloads"
-            option_args = ['--no-sandbox', '--headless', '--disable-dev-shm-usage', "disable-infobars", '--blink-settings=imagesEnabled=false', '--start-maximized'
-                            '--ignore-certificate-errors', '--ignore-ssl-errors']
-
-            prefs = {'download.default_directory' : download_path, 'profile.default_content_setting_values.automatic_downloads': 1, 
-                     "download.prompt_for_download": False,"download.directory_upgrade": True, "safebrowsing.enabled": True,
-                     "translate_whitelists": {"vi":"en"}, "translate":{"enabled":"true"}}
-            options.add_experimental_option('prefs', prefs)
-            options.add_experimental_option('excludeSwitches', ['enable-logging'])
-            for option in option_args:
-                options.add_argument(option)
-            driver = webdriver.Chrome(service=ChromiumService(chrome_driver_path), options=options)
-        else:
-
-            options.add_argument("--headless") # Set the Chrome webdriver to run in headless mode for 
-            options.add_argument('--no-sandbox')
-            options.add_argument("--disable-dev-shm-using")
-            options.add_argument("disable-infobars")
-            options.add_argument('--blink-settings=imagesEnabled=false')
-            driver = webdriver.Chrome(options=options)
-        return driver
+        self.base_path = "abfss://landingzone@storagetiltdevelop.dfs.core.windows.net/tiltEP/"
+    
+    async def bound_fetch(self, sem, url, session, function, pbar):
+        # Getter function with semaphore.
+        async with sem:
+            result = await function(url, session)
+            pbar.update(1)
+            return result
+    
+    async def send_async_task(self, links, function):
+        tasks = []
+        # create instance of Semaphore
+        sem = asyncio.Semaphore(1000)
+        
+        # Create client session that will ensure we dont open new connection
+        # per each request.
+        async with aiohttp.ClientSession() as session:
+            # start timer
+            pbar = tqdm(total=len(links), desc='Scraping')    
+            for link in links:
+                # pass Semaphore and session to every GET request
+                task = asyncio.ensure_future(self.bound_fetch(sem, link, session, function, pbar))
+                tasks.append(task)
+            responses = await asyncio.gather(*tasks)
+        return responses
     
     # Function to generate a unique ID for each product name using a hash function
     def generate_hash_id(self, name):
         return hashlib.md5(name.encode()).hexdigest()
     
-    def extract_products_and_services(self, out: string, link: string):
-        company_id = link.split("/")[-2].lower()+ "_" + link.split("/")[-1].split(".")[0]
-        current_driver = self.get_driver()
-        current_driver.get(link)
-        self.cookie_handler(current_driver)
-
-        # check if there is a particular element that needs to be clicked to reveal more products
-        try:
-            WebDriverWait(current_driver, 2).until(EC.element_to_be_clickable((By.XPATH, "//section[@class='ep-keywords ep-page-epage-home__order-other pb-4']/button")))
-            current_driver.find_element(By.XPATH,"//section[@class='ep-keywords ep-page-epage-home__order-other pb-4']/button").click()
-        except Exception as e:
-            pass
-
-        # wait 2 seconds to simulate human behavior
-        time.sleep(2)
-        # then scrape from the page
-        soup = BeautifulSoup(current_driver.page_source, "html.parser")
-        # get the activities
-        activities = [activity.text.strip() for activity in soup.find("ul", class_="ep-keywords__list pl-0").find_all("li")]  
-        # merge the list together separate by |
-        activities = ' | '.join(activities).lower()
-
-        with open(out, 'a') as file:
-            writer = csv.writer(file)
-            writer.writerow([activities, company_id])
-            file.close()
-        current_driver.quit()
-
-    def extract_ep_categories_and_sectors(self, out: string, link: string):
-        current_driver = self.get_driver()
-        current_driver.get(link)
-        self.cookie_handler(current_driver)
-
-        try:
-            WebDriverWait(current_driver, 2).until(EC.element_to_be_clickable((By.CLASS_NAME, "ep-show-more-less")))
-            buttons = current_driver.find_elements(By.CLASS_NAME,"ep-show-more-less")
-            for button in buttons:
-                button.click()
-        except Exception as e:
-            pass
-
-        # wait 2 seconds to simulate human behavior
-        time.sleep(2)
-        # then scrape from the page
-        soup = BeautifulSoup(current_driver.page_source, "html.parser")
-
-        # get the categories
-        cards = soup.find_all("li", class_="ep-business-sector-item")
-        for card in cards:
-            category = " ".join(card.find("span", class_="ep-card-title__text").text.strip().split())
-            sectors = card.find_all("a", class_="ep-link-list")
-            for sector in sectors:
-                with open(out, 'a') as file:
-                    writer = csv.writer(file)
-                    writer.writerow([category, " ".join(sector.text.strip().split())])
-                    file.close()
-        current_driver.quit()
-
-    def extract_ep_subsectors(self, out: string, link: string):
-
-        current_driver = self.get_driver()
-        current_driver.get(link)
-
-        self.cookie_handler(current_driver)
-
-        soup = BeautifulSoup(current_driver.page_source, "html.parser")
-
-        # get the subsectors
-        subsectors = soup.find_all("a", class_="ep-link-list px-4 py-3 text-decoration-none d-flex")
-        for subsector in subsectors:
-            # print(subsector.text.strip())
-            category = " ".join(soup.find_all("a", class_="v-breadcrumbs__item")[-1].text.strip().split())
-            sector = " ".join(soup.find("div", class_="v-breadcrumbs__item").text.strip().split())
-            with open(out, 'a') as file:
-                writer = csv.writer(file)
-                writer.writerow([self.generate_hash_id(subsector.text.strip()), re.sub('[^0-9a-zA-Z]+', "_", category.lower()), re.sub('[^0-9a-zA-Z]+', "_", sector.lower()), re.sub('[^0-9a-zA-Z]+', "_", subsector.text.strip().lower()), "https://www.europages.co.uk{}".format(subsector["href"])])
-                file.close()
-
-        current_driver.quit()
-
-    def extract_company_urls(self, provided_driver, link: string):
-        provided_driver.get(link)
-
-        self.cookie_handler(provided_driver)
-        last_page_reached = False   
-        # try to click the next page button
-        # while not last_page_reached:
-        while not last_page_reached:
+    async def extract_products_and_services(self, url, session):
+        async with session.get(url,timeout=5000) as response: # not using proxy at the moment
+            company_id = url.split("/")[-2].lower()+ "_" + url.split("/")[-1].split(".")[0].lower()
+            body = await response.text()
+            soup = BeautifulSoup(body, 'html.parser')
+            activities = []
+            size_keywords = 0
+            # check if you can there is extra information that can be scraped
             try:
-                soup = BeautifulSoup(provided_driver.page_source, "html.parser")
-                # get the company urls
-                company_url_final_part = soup.find_all("a", class_="ep-ecard-serp__epage-link")
-                company_urls = ["https://www.europages.co.uk" + company["href"] for company in company_url_final_part]
-                WebDriverWait(provided_driver, 2).until(EC.element_to_be_clickable((By.XPATH, "//ul[@class='ep-server-side-pagination__list text-center pl-0 pt-5']/li[last()]/a[@class='ep-server-side-pagination-item rounded ep-server-side-pagination__prev-next elevation-2']")))
-                next_page = provided_driver.find_elements(By.XPATH, "//ul[@class='ep-server-side-pagination__list text-center pl-0 pt-5']/li[last()]/a[@class='ep-server-side-pagination-item rounded ep-server-side-pagination__prev-next elevation-2']")
-                provided_driver.get(next_page[-1].get_attribute("href"))
+                backend_script = soup.find("script", string=re.compile(r"^window\.__NUXT__"))
+                # Extract the information between "keywords: [ ]"
+                keywords = re.findall(r'keywords:\s*\[(.*?)\]', '\n'.join(backend_script), re.DOTALL)
+                # Remove leading and trailing whitespaces from each keyword
+                keywords = [keyword.strip() for keyword in keywords]
+                matches = re.findall(r'id:"keyword-(\d+)"', keywords[1])
+                indexes = [int(match) for match in matches]
+                size_keywords = len(indexes)
+                # Extract the words between "name:" and "}"
+                words = [unidecode.unidecode(word.lower()).strip() for word in re.findall(r'name:"(.*?)"', keywords[1])]
+                activities.append(words)
             except Exception as e:
-                last_page_reached = True
-        return company_urls
-    
-    def extract_company_information(self, out: string, classification: pd.DataFrame, link: str):
-        subsector_base_url = link.rsplit("/",2)[0] + "/" + link.rsplit("/",2)[2] 
-        current_driver = self.get_driver()
-        companies_for_subsector_urls = self.extract_company_urls(current_driver, link)
-        filename = out.split("/")[-1]
-        for url in companies_for_subsector_urls:
-            current_driver.get(url)
-
-            self.cookie_handler(current_driver)
-            all_info = {"company_name": "", "group": "" , "sector": "", "subsector": "", "main_activity": "", "address": "", "company_city": "", 
-                        "postcode": "", "country": "", "products_and_services": "", "information": "", "min_headcount": "", "max_headcount": "", "type_of_building_for_registered_address": "", 
-                        "verified_by_europages": "", "year_established": "", "websites": "", "download_datetime": "", "id": "", "filename": filename}
-            
-            ## ID
-            company_id = url.split("/")[-2].lower()+ "_" + url.split("/")[-1].split(".")[0]
-            all_info["id"] = company_id
-
-            ## PRODUCT AND SERVICES
-            # check if there is a particular element that needs to be clicked to reveal more products
+                pass
             try:
-                WebDriverWait(current_driver, 2).until(EC.element_to_be_clickable((By.XPATH, "//section[@class='ep-keywords ep-page-epage-home__order-other pb-4']/button")))
-                current_driver.find_element(By.XPATH,"//section[@class='ep-keywords ep-page-epage-home__order-other pb-4']/button").click()
+                activities.append([codecs.decode(unidecode.unidecode(activity.text.lower()), 'unicode_escape').strip() for activity in soup.find("ul", class_="ep-keywords__list pl-0").find_all("li")])
+                flattened_activities = list(set(itertools.chain.from_iterable(activities)))
+                obtained_size = len(flattened_activities)
+                # merge the list together separate by |
+                activities = [' | '.join(flattened_activities)]
             except Exception as e:
                 pass
 
-            # wait 2 seconds to simulate human behavior
-            time.sleep(2)
-            # then scrape from the page
-            soup = BeautifulSoup(current_driver.page_source, "html.parser")
-            # get the activities
-            products_and_services = [activity.text.strip() for activity in soup.find("ul", class_="ep-keywords__list pl-0").find_all("li")]  
-            # merge the list together separate by |
-            products_and_services = ' | '.join(products_and_services).lower()
-            all_info["products_and_services"] = products_and_services
+            # Print the extracted words
+            if activities == []:
+                return {"id": company_id, "activities": activities, "coverage": 0}
+            else:
+                return {"id": company_id, "activities": activities, "obtained_size": obtained_size, "size_keywords": size_keywords, "coverage": (obtained_size/size_keywords)*100 if size_keywords > 0 else 100}
+
+    async def extract_ep_categories_and_sectors(self, url, session):
+        async with session.get(url,timeout=5000) as response: 
+            body = await response.text()
+            soup = BeautifulSoup(body, 'html.parser')
+            cats_and_sectors = []
+            # get the categories
+            cards = soup.find_all("li", class_="ep-business-sector-item")
+            for card in cards:
+                category = " ".join(card.find("span", class_="ep-card-title__text").text.strip().split())
+                sectors = card.find_all("a", class_="ep-link-list")
+                for sector in sectors:
+                    cats_and_sectors.append([category, " ".join(sector.text.strip().split())])
+            return cats_and_sectors
+        
+    async def extract_ep_subsectors(self, url, session):
+        async with session.get(url,timeout=5000) as response: 
+            body = await response.text()
+            soup = BeautifulSoup(body, 'html.parser')
+            cats_sectors_and_subsectors = []
+            # get the subsectors
+            subsectors = soup.find_all("a", class_="ep-link-list px-4 py-3 text-decoration-none d-flex")
+            for subsector in subsectors:
+                # print(subsector.text.strip())
+                category = " ".join(soup.find_all("a", class_="v-breadcrumbs__item")[-1].text.strip().split())
+                sector = " ".join(soup.find("div", class_="v-breadcrumbs__item").text.strip().split())
+                cats_sectors_and_subsectors.append([self.generate_hash_id(subsector.text.strip()), 
+                                                    re.sub('[^0-9a-zA-Z]+', "_", category.lower()), 
+                                                    re.sub('[^0-9a-zA-Z]+', "_", sector.lower()), 
+                                                    re.sub('[^0-9a-zA-Z]+', "_", subsector.text.strip().lower()), 
+                                                    "https://www.europages.co.uk{}".format(subsector["href"])])
+            return cats_sectors_and_subsectors
+            
+    async def extract_company_urls(self, url, session):
+        async with session.get(url,timeout=5000) as response: 
+            body = await response.text()
+            soup = BeautifulSoup(body, 'html.parser')
+            # get the company urls
+            company_url_final_part = soup.find_all("a", class_="ep-ecard-serp__epage-link")
+            company_urls = ["https://www.europages.co.uk" + company["href"] for company in company_url_final_part]
+        return company_urls
+    
+    async def extract_subsector_page_urls(self, url, session):
+        async with session.get(url,timeout=5000) as response: 
+            body = await response.text()
+            soup = BeautifulSoup(body, 'html.parser')
+            try:
+                subsector_page_size = int(soup.find_all("a", class_="ep-server-side-pagination-item")[-2].text.strip())
+                subsector_page_urls = [url.rsplit("/", 1)[0] + "/pg-{}/".format(i) + url.rsplit("/", 1)[1] for i in range(1, subsector_page_size+1)]
+            except:
+                subsector_page_urls = [url]
+            return await self.send_async_task(subsector_page_urls, self.extract_company_urls)
+    
+    async def extract_company_information(self, url, session):
+        async with session.get(url,timeout=5000) as response: 
+            body = await response.text()
+            soup = BeautifulSoup(body, 'html.parser')
+            all_info = {"company_name": "", "group": "" , "sector": "", "subsector": "", "main_activity": "", "address": "", "company_city": "", 
+                        "postcode": "", "country": "", "products_and_services": "", "information": "", "min_headcount": "", "max_headcount": "", "type_of_building_for_registered_address": "", 
+                        "verified_by_europages": "", "year_established": "", "websites": "", "download_datetime": "", "id": "", "filename": ""}
+            
+            ## ID
+            company_id = url.split("/")[-2].lower()+ "_" + url.split("/")[-1].split(".")[0].lower()
+            all_info["id"] = company_id
+
+            ## PRODUCT AND SERVICES
+            activities = []
+            # check if you can there is extra information that can be scraped
+            try:
+                backend_script = soup.find("script", string=re.compile(r"^window\.__NUXT__"))
+                # Extract the information between "keywords: [ ]"
+                keywords = re.findall(r'keywords:\s*\[(.*?)\]', '\n'.join(backend_script), re.DOTALL)
+                # Remove leading and trailing whitespaces from each keyword
+                keywords = [keyword.strip() for keyword in keywords]
+                matches = re.findall(r'id:"keyword-(\d+)"', keywords[1])
+                indexes = [int(match) for match in matches]
+                # Extract the words between "name:" and "}"
+                words = [unidecode.unidecode(word.lower()).strip() for word in re.findall(r'name:"(.*?)"', keywords[1])]
+                activities.append(words)
+            except Exception as e:
+                pass
+            try:
+                activities.append([codecs.decode(unidecode.unidecode(activity.text.lower()), 'unicode_escape').strip() for activity in soup.find("ul", class_="ep-keywords__list pl-0").find_all("li")])
+                flattened_activities = list(set(itertools.chain.from_iterable(activities)))
+                # merge the list together separate by |
+                activities = [' | '.join(flattened_activities)]
+            except Exception as e:
+                pass
+            all_info["products_and_services"] = activities
 
             ## KEY FIGURES
             try:
@@ -239,18 +199,6 @@ class EuroPagesProductsScraper():
             ## COMPANY_NAME
             company_name = soup.find("h1", class_="ep-epages-header-title").text.split("-")[0].strip().lower()
             all_info["company_name"] = company_name
-
-            ## SUBSECTOR
-            subsector = classification[classification["subsector_url"] == subsector_base_url]["subsector"].values[0]
-            all_info["subsector"] = subsector
-
-            row_of_relevancy = classification[classification["subsector"] == subsector]
-            sector = row_of_relevancy["sector"].values[0]
-            all_info["sector"] = sector
-
-            ## GROUP
-            group = row_of_relevancy["group"].values[0]
-            all_info["group"] = group
 
             try:
                 ## ORGANISATION
@@ -292,247 +240,87 @@ class EuroPagesProductsScraper():
                 all_info["postcode"] = location_info[2].text.strip().split("-")[0].strip().split(" ", 1)[0].lower()
             except Exception as e:
                 pass
-
-            # write all the values of the dictionary to the csv file
-            with open(out, 'a') as file:
-                writer = csv.writer(file, delimiter=";")
-                writer.writerow([*all_info.values()])
-                file.close()
+            
+            return all_info
+    
+    async def scrape_and_export(self, type="product_updater", country=None, group=None, sector=None):
+        print("--- Starting scraping procedure--")
         
-        current_driver.quit()
-
-    def scrape_and_export(self, type="product_updater", input_file=None, country=None, sector=None):
-        # List of jobs to get executed
-        executors_list = []
-
         if type == "product_updater":
-            out = f"../output_data/product_updater_out_{time.time()}.csv"
-            with open(out, mode='w', newline='') as file:
-                writer = csv.writer(file, delimiter=";")
-                writer.writerow(["product_and_services", "id"])
-                file.close()
-            try:
-                companies_t = pd.read_csv(input_file)["id"].tolist()
-            except Exception as e:
-                raise Exception("Please provide a valid input file")
-            companies = [company.upper() for company in companies_t]
+            if 'DATABRICKS_RUNTIME_VERSION' in os.environ:
+                files = [x[0] for x in dbutils.fs.ls("abfss://landingzone@storagetiltdevelop.dfs.core.windows.net/tiltEP/") if f"/{country}" in x[0]]
+            else:
+                files = [x[0] for x in dbutils.fs.ls("abfss:/mnt/indicatorBefore/tiltEP/") if f"/{country}" in x[0]]
+
+            complete_ids = []
+            for i in range(len(files)):
+                x = spark.read.csv(files[i],header=True, inferSchema=True, sep=";").toPandas()
+                ids = list(x.drop_duplicates(subset="id")["id"])
+                complete_ids.append(ids)
+
+            complete_ids = list(set([item for sublist in complete_ids for item in sublist]))
+            companies = [company.upper() for company in complete_ids]
             links = np.array([self.base_url.format(*company.split("_")) for company in companies])
-            args = [self.extract_products_and_services, out] # args is always of structure [function, *function_args]
+            results = await self.send_async_task(links, self.extract_products_and_services)
 
         elif type == "company_scraper":
-            input = "../output_data/sohail_ep_categories.csv"
+            input = "../output_data/ep_categorization.csv"
             categorization = pd.read_csv(input)
-            # only get rows where the sector column is equal to "Agriculture - Machines & Equipment"
-            group = categorization[categorization["sector"] == sector]["group"].tolist()[0]
             subsector_urls = categorization[categorization["sector"] == sector]["subsector_url"].tolist()
-            subsector_urls = [subsector_url.rsplit("/",1)[0]+ "/{}/".format(country) + subsector_url.rsplit("/",1)[1] for subsector_url in subsector_urls][:20]
+            country_filtered_subsector_urls = [subsector_url.rsplit("/",1)[0]+ "/{}/".format(country) + subsector_url.rsplit("/",1)[1] for subsector_url in subsector_urls]
 
             out = f"../output_data/{country}-{group}-{sector}.csv"
-            with open(out, mode='w', newline='') as file:
-                writer = csv.writer(file, delimiter=";")
-                writer.writerow(["company_name","group", "sector", "subsector", "main_activity" ,"address", "company_city", "postcode", "country", "products_and_services",
-                                 "information", "min_headcount", "max_headcount", "type_of_building_for_registered_address", "verified_by_europages", "year_established","websites"
-                                ,"download_datetime" ,"id", "filename"])
-                file.close()
 
-            links = subsector_urls
-            args = [self.extract_company_information, out, categorization] # args is always of structure [function, *function_args]
+            all_company_info = []
+            for i in range(len(subsector_urls)):
+                subsector = categorization[categorization["subsector_url"] == subsector_urls[i]]["subsector"].values[0]
+                company_urls = (await self.send_async_task([country_filtered_subsector_urls[i]], self.extract_subsector_page_urls))[0]
+                # flatten company_urls
+                company_urls = [item for sublist in company_urls for item in sublist]
+                company_info = await self.send_async_task(company_urls, self.extract_company_information)
+                # for every company_info line, set the group, sector and subsector
+                for company in company_info:
+                    company["group"] = group
+                    company["sector"] = sector
+                    company["subsector"] = subsector
+                    company["filename"] = out.rsplit("/", 1)[1]
+                all_company_info.append(company_info)
 
-        elif type == "business_sectors_scraper":
-            out = f"../output_data/recent_business_sectors_scraper_out.csv"
-            with open(out, mode='w', newline='') as file:
-                writer = csv.writer(file, delimiter=";")
-                writer.writerow(["group", "sector"])
-                file.close()
-            links = ["https://www.europages.co.uk/bs"]
-            args = [self.extract_ep_categories_and_sectors, out] # args is always of structure [function, *function_args]
+            # flatten company_info
+            all_company_info = [item for sublist in all_company_info for item in sublist]
+
+            # convert to pandas dataframe
+            all_company_info_df = pd.DataFrame(all_company_info)
+            if "DATABRICKS_RUNTIME_VERSION" in os.environ:
+            # Convert the pandas dataframe to a spark sql dataframe
+                all_company_info_spark = spark.createDataFrame(all_company_info_df)
+                all_company_info_spark = all_company_info_spark.withColumn("download_datetime", all_company_info_spark["download_datetime"].cast("String"))
+                
+                all_company_info_spark.coalesce(1).write.option("sep",";").csv(self.base_path+"address-temp/",  mode="overwrite", header=True)
+
+                ##This remove all CRC files
+                file_path = dbutils.fs.ls(self.base_path+"address-temp/")
+                csv_path = [x.path for x in file_path if x.name.endswith(".csv")][0]
+                dbutils.fs.cp(csv_path ,out)
+                dbutils.fs.rm(self.base_path+"address-temp/", recurse=True)
+            else:
+                # export to csv
+                all_company_info_df.to_csv(out, sep=";", index=False)
 
         elif type == "categories_scraper":
-            input = "../output_data/recent_business_sectors_scraper_out.csv"
-            categories = pd.read_csv(input)["group"].tolist()
-            sectors = pd.read_csv(input)["sector"].tolist()
-            out = f"../output_data/sohail_ep_categories.csv"
+            out = f"../output_data/ep_categorization.csv"
+            cats_and_sectors = (await self.send_async_task(["https://www.europages.co.uk/bs"], self.extract_ep_categories_and_sectors))[0]
+            cats_and_sectors_links = ['https://www.europages.co.uk/bs/{0}/{1}'.format(re.sub('[^0-9a-zA-Z]+', "-", cats_and_sectors[i][0].lower()), re.sub('[^0-9a-zA-Z]+', "-", cats_and_sectors[i][1].lower())) 
+                                      for i in range(len(cats_and_sectors))]
+            cats_sectors_and_subsectors = (await self.send_async_task(cats_and_sectors_links, self.extract_ep_subsectors))
+            # flatten cats_sectors_and_subsectors
+            results = [item for sublist in cats_sectors_and_subsectors for item in sublist]
+            # write out to a csv file with the following headers: category, sector, subsector, subsector_url
             with open(out, mode='w', newline='') as file:
-                writer = csv.writer(file, delimiter=";")
-                writer.writerow(["category_id", "group", "sector", "subsector", "subsector_url"])
+                writer = csv.writer(file, delimiter=",")
+                writer.writerow(["id", "category", "sector", "subsector", "subsector_url"])
+                for subsector in results:
+                    writer.writerow(subsector)
                 file.close()
-            links = ['https://www.europages.co.uk/bs/{0}/{1}'.format(re.sub('[^0-9a-zA-Z]+', "-", categories[i].lower()), re.sub('[^0-9a-zA-Z]+', "-", sectors[i].lower())) for i in range(len(categories))]
-            args = [self.extract_ep_subsectors, out] # args is always of structure [function, *function_args]
 
-        print("--- Starting scraping procedure--")
-        # start timer
-        start_time = time.time()
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            # Add the 10 concurrent tasks to scrape product data from different parts of the 'links' list
-            for i in range(len(links)):
-                executors_list.append(
-                    executor.submit(*args, links[i])
-                )
-
-        wait(executors_list)
-
-        # calculate duration of scraping procedure
-        duration = time.time() - start_time
-        print("--- Finished scraping procedure. Duration: {}---".format(duration))
-
-class KvKNumberScraper():
-    def __init__(self):
-        self.search_box_url = "https://www.kvk.nl/zoeken/handelsregister/?postcode={}&zoekvervallen=0&zoekuitgeschreven=0"
-        self.all_postal_codes = []
-
-    def cookie_handler(self, provided_driver):
-        try:
-            WebDriverWait(provided_driver, 2).until(EC.element_to_be_clickable((By.XPATH, "//div[@class='o-grid-column-start-1-end-13']/button[@type='button']"))).click()
-        except Exception as e:
-            pass
-        time.sleep(1)
-
-    def get_driver(self):
-        options = webdriver.ChromeOptions() 
-        options.add_argument("--headless") # Set the Chrome webdriver to run in headless mode for 
-        options.add_argument('--disable-dev-shm-usage')
-        driver = webdriver.Remote(
-            command_executor="http://localhost:4444", options=options
-        )
-        print("Driver has been created")
-        return driver
-    
-    def extract_postal_codes(self):
-        # get all postal codes csv files beneath the input_data/dutch_postal-codes-master directory
-        files = [os.path.normpath(i).replace(os.sep, '/') for i in glob.glob("../input_data/dutch-postal-codes-master/*.csv")] 
-        # create a set of postal codes
-        postal_codes = set()
-        for file in files:
-            # read the csv file
-            df = pd.read_csv(file)
-            # add the postal codes to the set
-            postal_codes.update(df["postal_code"].tolist())
-        # convert the set to a list
-        postal_codes = list(postal_codes)
-        # sort the list
-        postal_codes.sort()
-        self.all_postal_codes = postal_codes
-
-    def extract_kvk_numbers(self, links_array: list, kvk_data: list, driver_name: str):
-        current_driver = self.get_driver()
-        for link in links_array:
-            print(driver_name, "is scraping postal code", link)
-            current_driver.get(link)
-            self.cookie_handler(current_driver)
-            pages = current_driver.find_elements(By.XPATH,"//nav[@class='nav-new text-center']/ul/li/button")
-
-            if len(pages)==0:
-                divs = BeautifulSoup(current_driver.page_source, "html.parser").find_all("ul", class_="kvk-meta")
-                for div in divs:
-                    kvk_data.append(div.find("li").text.split(" ").pop(1).strip())        
-            else:
-                for page in pages:
-                    page.click()
-                    time.sleep(1)
-                    # get all divs of class "content"
-                    divs = BeautifulSoup(current_driver.page_source, "html.parser").find_all("ul", class_="kvk-meta")
-                    for div in divs:
-                        kvk_data.append(div.find("li").text.split(" ").pop(1).strip())        
-        current_driver.quit()
-
-    def scrape(self):
-        self.extract_postal_codes()
-        # pick 1000 random postal codes
-        random_postal_codes = random.sample(self.all_postal_codes, 10000)
-        links = np.array([self.search_box_url.format(postal_code) for postal_code in random_postal_codes])
-        # List of jobs to get executed
-        executors_list = []
-        # split the list by the number of cores
-        splitted_links = np.array_split(links, os.cpu_count())
-        kvk_numbers = []
-        print("Scraping KVK numbers from the Dutch Chamber of Commerce")
-        with ThreadPoolExecutor() as executor:
-            # Add the 10 concurrent tasks to scrape product data from different parts of the 'links' list
-            for i in range(len(splitted_links)):
-                executors_list.append(
-                    executor.submit(self.extract_kvk_numbers, splitted_links[i], kvk_numbers, f"Driver {i}")
-                )
-
-        # Wait for all tasks to complete
-        for x in executors_list:
-            print(x)
-        
-        kvk_numbers = list(set(kvk_numbers))
-        # create a pandas dataframe from the list of kvk numbers and export to a csv file
-        df = pd.DataFrame(kvk_numbers, columns=["kvk_number"])
-        # make the kvk numbers as strings
-        df["kvk_number"] = df["kvk_number"].astype(str)
-        df.to_csv("../output_data/scraped_kvk_numbers.csv", index=False)
-        
-
-class SMECompaniesScraper():
-
-    def __init__(self):
-        self.kvk_search_url = 'https://www.samrate.com/nl/search?q="{}"'
-        # read the kvk numbers from the csv file as a list
-        self.kvk_numbers = pd.read_csv("../output_data/scraped_kvk_numbers.csv")["kvk_number"].tolist()
-
-    def retrieve_html(self, url):
-        page = requests.get(url)
-        soup = BeautifulSoup(page.content, "html.parser")
-        return soup
-    
-    def preprocess(self, text):
-        text = text.strip().lower()
-        text = unidecode.unidecode(text)
-        text = re.sub(r"[,;()'./&%]", "", text)
-        text = re.sub(r"\s+", "-", text)
-        text = re.sub(r"-+", "-", text)
-        return text
-    
-    def scrape(self):
-
-        print("Scraping per kvk number from SamRate")
-        company_information = [] 
-        for i in tqdm(range(len(self.kvk_numbers)), bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}'):
-            search_url = self.kvk_search_url.format(str(self.kvk_numbers[i]))
-            search_output = self.retrieve_html(search_url)
-            companies_html = [t for t in search_output.find_all("div", class_="flex w-full")]
-            for company_html in companies_html:
-                company_details_html = company_html.find_all("span")
-                company_information.append({"kvk_number": str(self.kvk_numbers[i]), "company_name": company_details_html[0].text.strip(), "company_city": company_details_html[1].text.strip()})
-
-
-        print("Scraping all company details from SamRate")
-        company_details = []
-        for i in tqdm(range(len(company_information)), bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}'):
-            company_name = self.preprocess(company_information[i]["company_name"])
-            company_city = self.preprocess(company_information[i]["company_city"])
-            kvk_number = company_information[i]["kvk_number"]
-            search_url =  "https://www.samrate.com/nl/{}".format(company_name + "-"+ company_city +"-"+ kvk_number)
-            soup = self.retrieve_html(search_url) 
-            data = []
-
-            for comment in soup.find_all(string=lambda text:isinstance(text, Comment)):
-                if comment.strip() == 'Details':
-                    next_node = comment.next_sibling
-
-                    while next_node and next_node.next_sibling:
-                        data.append(next_node)
-                        next_node = next_node.next_sibling
-
-                        if not next_node.name and next_node.strip() == 'Widgets': 
-                            break
-            if len(data) > 0:
-                data = data[1].find_all("div", class_ = re.compile(".*flex"))
-
-                company_info = []
-                for element in data:
-                    # create a dictionary element where the key is the first span element and the value is the second span element
-                    company_info.append({element.find_all("span")[0].text.strip(): element.find_all("span")[1].text.strip()})
-                
-                # flatten the list of dictionaries
-                company_info = {k: v for d in company_info for k, v in d.items()}
-                company_details.append(company_info)
-        
-        # convert to pd.DataFrame and export to CSV
-        df = pd.DataFrame(company_details)
-        df.to_csv("../output_data/scraped_SME_companies.csv", index=False)
-        
-
-
+        print("--- Finished scraping procedure. Duration: DURATION MISSING---")
