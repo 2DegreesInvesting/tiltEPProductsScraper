@@ -19,9 +19,8 @@ import asyncio
 import aiohttp
 import codecs
 
-if 'DATABRICKS_RUNTIME_VERSION' not in os.environ:
-    spark = SparkSession.builder.getOrCreate()
-    dbutils = DBUtils(spark)
+spark = SparkSession.builder.getOrCreate()
+dbutils = DBUtils(spark)
 
 class EuroPagesProductsScraper():
     """
@@ -62,11 +61,9 @@ class EuroPagesProductsScraper():
     
     async def extract_products_and_services(self, url, session):
         async with session.get(url,timeout=5000) as response: # not using proxy at the moment
-            company_id = url.split("/")[-2].lower()+ "_" + url.split("/")[-1].split(".")[0].lower()
             body = await response.text()
             soup = BeautifulSoup(body, 'html.parser')
             activities = []
-            size_keywords = 0
             # check if you can there is extra information that can be scraped
             try:
                 backend_script = soup.find("script", string=re.compile(r"^window\.__NUXT__"))
@@ -74,9 +71,6 @@ class EuroPagesProductsScraper():
                 keywords = re.findall(r'keywords:\s*\[(.*?)\]', '\n'.join(backend_script), re.DOTALL)
                 # Remove leading and trailing whitespaces from each keyword
                 keywords = [keyword.strip() for keyword in keywords]
-                matches = re.findall(r'id:"keyword-(\d+)"', keywords[1])
-                indexes = [int(match) for match in matches]
-                size_keywords = len(indexes)
                 # Extract the words between "name:" and "}"
                 words = [unidecode.unidecode(word.lower()).strip() for word in re.findall(r'name:"(.*?)"', keywords[1])]
                 activities.append(words)
@@ -85,17 +79,11 @@ class EuroPagesProductsScraper():
             try:
                 activities.append([codecs.decode(unidecode.unidecode(activity.text.lower()), 'unicode_escape').strip() for activity in soup.find("ul", class_="ep-keywords__list pl-0").find_all("li")])
                 flattened_activities = list(set(itertools.chain.from_iterable(activities)))
-                obtained_size = len(flattened_activities)
                 # merge the list together separate by |
-                activities = [' | '.join(flattened_activities)]
+                activities = ' | '.join(flattened_activities)
+                return activities
             except Exception as e:
                 pass
-
-            # Print the extracted words
-            if activities == []:
-                return {"id": company_id, "activities": activities, "coverage": 0}
-            else:
-                return {"id": company_id, "activities": activities, "obtained_size": obtained_size, "size_keywords": size_keywords, "coverage": (obtained_size/size_keywords)*100 if size_keywords > 0 else 100}
 
     async def extract_ep_categories_and_sectors(self, url, session):
         async with session.get(url,timeout=5000) as response: 
@@ -171,7 +159,6 @@ class EuroPagesProductsScraper():
                 # Remove leading and trailing whitespaces from each keyword
                 keywords = [keyword.strip() for keyword in keywords]
                 matches = re.findall(r'id:"keyword-(\d+)"', keywords[1])
-                indexes = [int(match) for match in matches]
                 # Extract the words between "name:" and "}"
                 words = [unidecode.unidecode(word.lower()).strip() for word in re.findall(r'name:"(.*?)"', keywords[1])]
                 activities.append(words)
@@ -181,7 +168,7 @@ class EuroPagesProductsScraper():
                 activities.append([codecs.decode(unidecode.unidecode(activity.text.lower()), 'unicode_escape').strip() for activity in soup.find("ul", class_="ep-keywords__list pl-0").find_all("li")])
                 flattened_activities = list(set(itertools.chain.from_iterable(activities)))
                 # merge the list together separate by |
-                activities = [' | '.join(flattened_activities)]
+                activities = ' | '.join(flattened_activities)
             except Exception as e:
                 pass
             all_info["products_and_services"] = activities
@@ -269,7 +256,7 @@ class EuroPagesProductsScraper():
             subsector_urls = categorization[categorization["sector"] == sector]["subsector_url"].tolist()
             country_filtered_subsector_urls = [subsector_url.rsplit("/",1)[0]+ "/{}/".format(country) + subsector_url.rsplit("/",1)[1] for subsector_url in subsector_urls]
 
-            out = f"../output_data/{country}-{group}-{sector}.csv"
+            out = f"{country}-{group}-{sector}.csv"
 
             all_company_info = []
             for i in range(len(subsector_urls)):
@@ -283,7 +270,7 @@ class EuroPagesProductsScraper():
                     company["group"] = group
                     company["sector"] = sector
                     company["subsector"] = subsector
-                    company["filename"] = out.rsplit("/", 1)[1]
+                    company["filename"] = out
                 all_company_info.append(company_info)
 
             # flatten company_info
@@ -293,6 +280,7 @@ class EuroPagesProductsScraper():
             all_company_info_df = pd.DataFrame(all_company_info)
             if "DATABRICKS_RUNTIME_VERSION" in os.environ:
             # Convert the pandas dataframe to a spark sql dataframe
+                display(all_company_info_df)
                 all_company_info_spark = spark.createDataFrame(all_company_info_df)
                 all_company_info_spark = all_company_info_spark.withColumn("download_datetime", all_company_info_spark["download_datetime"].cast("String"))
                 
@@ -301,11 +289,13 @@ class EuroPagesProductsScraper():
                 ##This remove all CRC files
                 file_path = dbutils.fs.ls(self.base_path+"address-temp/")
                 csv_path = [x.path for x in file_path if x.name.endswith(".csv")][0]
-                dbutils.fs.cp(csv_path ,out)
+                print(csv_path)
+                dbutils.fs.cp(csv_path ,self.base_path + out)
                 dbutils.fs.rm(self.base_path+"address-temp/", recurse=True)
             else:
                 # export to csv
-                all_company_info_df.to_csv(out, sep=";", index=False)
+                export = "../output_data/" + out
+                all_company_info_df.to_csv(export, sep=";", index=False)
 
         elif type == "categories_scraper":
             out = f"../output_data/ep_categorization.csv"
