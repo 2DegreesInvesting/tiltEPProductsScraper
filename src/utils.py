@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from pyspark.sql import SparkSession
 from pyspark.dbutils import DBUtils
+from urllib.parse import quote
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
@@ -97,6 +98,7 @@ class EuroPagesProductsScraper():
                 sectors = card.find_all("a", class_="ep-link-list")
                 for sector in sectors:
                     cats_and_sectors.append([category, " ".join(sector.text.strip().split())])
+
             return cats_and_sectors
         
     async def extract_ep_subsectors(self, url, session):
@@ -107,13 +109,14 @@ class EuroPagesProductsScraper():
             # get the subsectors
             subsectors = soup.find_all("a", class_="ep-link-list px-4 py-3 text-decoration-none d-flex")
             for subsector in subsectors:
-                # print(subsector.text.strip())
                 category = " ".join(soup.find_all("a", class_="v-breadcrumbs__item")[-1].text.strip().split())
                 sector = " ".join(soup.find("div", class_="v-breadcrumbs__item").text.strip().split())
+
                 cats_sectors_and_subsectors.append([self.generate_hash_id(subsector.text.strip()), 
                                                     re.sub('[^0-9a-zA-Z]+', "_", category.lower()), 
                                                     re.sub('[^0-9a-zA-Z]+', "_", sector.lower()), 
                                                     re.sub('[^0-9a-zA-Z]+', "_", subsector.text.strip().lower()), 
+                                                    "https://www.europages.co.uk/companies/{}.html".format(quote(sector.lower())),
                                                     "https://www.europages.co.uk{}".format(subsector["href"])])
             return cats_sectors_and_subsectors
             
@@ -254,11 +257,27 @@ class EuroPagesProductsScraper():
             input = "../output_data/ep_categorization.csv"
             categorization = pd.read_csv(input)
             subsector_urls = categorization[categorization["sector"] == sector]["subsector_url"].tolist()
-            country_filtered_subsector_urls = [subsector_url.rsplit("/",1)[0]+ "/{}/".format(country) + subsector_url.rsplit("/",1)[1] for subsector_url in subsector_urls]
-
+            sector_url = categorization[categorization["sector"] == sector]["sector_url"].values[0]
             out = f"{country}-{group}-{sector}.csv"
 
+            # store all company_information
             all_company_info = []
+
+            # first scrape on sector level
+            country_filtered_sector_url = sector_url.rsplit("/",1)[0]+ "/{}/".format(country) + sector_url.rsplit("/",1)[1]
+            company_urls = (await self.send_async_task([country_filtered_sector_url], self.extract_subsector_page_urls))[0]
+            # flatten company_urls
+            company_urls = [item for sublist in company_urls for item in sublist]
+            company_info = await self.send_async_task(company_urls, self.extract_company_information)
+            for company in company_info:
+                company["group"] = group
+                company["sector"] = sector
+                company["subsector"] = pd.NA
+                company["filename"] = out
+            all_company_info.append(company_info)
+
+            # then on subsector level
+            country_filtered_subsector_urls = [subsector_url.rsplit("/",1)[0]+ "/{}/".format(country) + subsector_url.rsplit("/",1)[1] for subsector_url in subsector_urls]
             for i in range(len(subsector_urls)):
                 subsector = categorization[categorization["subsector_url"] == subsector_urls[i]]["subsector"].values[0]
                 company_urls = (await self.send_async_task([country_filtered_subsector_urls[i]], self.extract_subsector_page_urls))[0]
@@ -278,6 +297,10 @@ class EuroPagesProductsScraper():
 
             # convert to pandas dataframe
             all_company_info_df = pd.DataFrame(all_company_info)
+            
+            # drop duplicates
+            all_company_info_df.drop_duplicates(inplace=True)
+
             if "DATABRICKS_RUNTIME_VERSION" in os.environ:
             # Convert the pandas dataframe to a spark sql dataframe
                 all_company_info_spark = spark.createDataFrame(all_company_info_df)
@@ -303,10 +326,11 @@ class EuroPagesProductsScraper():
             cats_sectors_and_subsectors = (await self.send_async_task(cats_and_sectors_links, self.extract_ep_subsectors))
             # flatten cats_sectors_and_subsectors
             results = [item for sublist in cats_sectors_and_subsectors for item in sublist]
+
             # write out to a csv file with the following headers: category, sector, subsector, subsector_url
             with open(out, mode='w', newline='') as file:
                 writer = csv.writer(file, delimiter=",")
-                writer.writerow(["id", "category", "sector", "subsector", "subsector_url"])
+                writer.writerow(["id", "category", "sector", "subsector", "sector_url", "subsector_url"])
                 for subsector in results:
                     writer.writerow(subsector)
                 file.close()
