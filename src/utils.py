@@ -6,7 +6,6 @@ from urllib.parse import quote
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-import chromedriver_autoinstaller
 import pandas as pd
 import numpy as np
 import unidecode
