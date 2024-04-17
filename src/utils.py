@@ -280,7 +280,6 @@ class EuroPagesProductsScraper():
             all_company_info_df = pd.DataFrame(all_company_info)
             if "DATABRICKS_RUNTIME_VERSION" in os.environ:
             # Convert the pandas dataframe to a spark sql dataframe
-                display(all_company_info_df)
                 all_company_info_spark = spark.createDataFrame(all_company_info_df)
                 all_company_info_spark = all_company_info_spark.withColumn("download_datetime", all_company_info_spark["download_datetime"].cast("String"))
                 
@@ -289,7 +288,6 @@ class EuroPagesProductsScraper():
                 ##This remove all CRC files
                 file_path = dbutils.fs.ls(self.base_path+"address-temp/")
                 csv_path = [x.path for x in file_path if x.name.endswith(".csv")][0]
-                print(csv_path)
                 dbutils.fs.cp(csv_path ,self.base_path + out)
                 dbutils.fs.rm(self.base_path+"address-temp/", recurse=True)
             else:
