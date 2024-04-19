@@ -112,9 +112,9 @@ class EuroPagesProductsScraper():
                 sector = " ".join(soup.find("div", class_="v-breadcrumbs__item").text.strip().split())
 
                 cats_sectors_and_subsectors.append([self.generate_hash_id(subsector.text.strip()), 
-                                                    re.sub('[^0-9a-zA-Z]+', "_", category.lower()), 
-                                                    re.sub('[^0-9a-zA-Z]+', "_", sector.lower()), 
-                                                    re.sub('[^0-9a-zA-Z]+', "_", subsector.text.strip().lower()), 
+                                                    re.sub('[^0-9a-zA-Z]+', "-", category.lower()), 
+                                                    re.sub('[^0-9a-zA-Z]+', "-", sector.lower()), 
+                                                    re.sub('[^0-9a-zA-Z]+', "-", subsector.text.strip().lower()), 
                                                     "https://www.europages.co.uk/companies/{}.html".format(quote(sector.lower())),
                                                     "https://www.europages.co.uk{}".format(subsector["href"])])
             return cats_sectors_and_subsectors
@@ -257,7 +257,7 @@ class EuroPagesProductsScraper():
             categorization = pd.read_csv(input)
             subsector_urls = categorization[categorization["sector"] == sector]["subsector_url"].tolist()
             sector_url = categorization[categorization["sector"] == sector]["sector_url"].values[0]
-            out = f"{country}-{group}-{sector}.csv"
+            out = f"{country}_{group}_{sector}.csv"
 
             # store all company_information
             all_company_info = []

@@ -10,7 +10,7 @@ async def main():
     if 'DATABRICKS_RUNTIME_VERSION' in os.environ:
         dbutils.library.restartPython()
     # Execute EuroPagesScraper
-    await EuroPagesProductsScraper().scrape_and_export("company_scraper", "italy", "agriculture_livestock", "agricultural_production")
+    await EuroPagesProductsScraper().scrape_and_export("company_scraper", "italy", "agriculture-livestock", "agricultural-production")
 
 # Run scraper
 if __name__ == "__main__":
